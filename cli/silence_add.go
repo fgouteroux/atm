@@ -14,20 +14,23 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/user"
 	"strconv"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-openapi/strfmt"
+	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/alertmanager/api/v2/client/silence"
 	"github.com/prometheus/alertmanager/api/v2/models"
-	"github.com/prometheus/alertmanager/matcher/compat"
+	"github.com/prometheus/alertmanager/matchers/compat"
 	"github.com/prometheus/alertmanager/pkg/labels"
 )
 
@@ -40,33 +43,37 @@ func username() string {
 }
 
 type silenceAddCmd struct {
-	author         string
-	requireComment bool
-	duration       string
-	start          string
-	end            string
-	comment        string
-	matchers       []string
+	author           string
+	requireComment   bool
+	duration         string
+	maxDuration      string
+	start            string
+	end              string
+	comment          string
+	matchers         []string
+	tenant           string
+	tenantFile       string
+	tenantHTTPHeader string
 }
 
 const silenceAddHelp = `Add a new alertmanager silence
 
-  Amtool uses a simplified Prometheus syntax to represent silences. The
+  atm uses a simplified Prometheus syntax to represent silences. The
   non-option section of arguments constructs a list of "Matcher Groups"
   that will be used to create a number of silences. The following examples
   will attempt to show this behaviour in action:
 
-  amtool silence add alertname=foo node=bar
+  atm silence add alertname=foo node=bar
 
 	This statement will add a silence that matches alerts with the
 	alertname=foo and node=bar label value pairs set.
 
-  amtool silence add foo node=bar
+  atm silence add foo node=bar
 
 	If alertname is omitted and the first argument does not contain a '=' or a
 	'=~' then it will be assumed to be the value of the alertname pair.
 
-  amtool silence add 'alertname=~foo.*'
+  atm silence add 'alertname=~foo.*'
 
 	As well as direct equality, regex matching is also supported. The '=~' syntax
 	(similar to Prometheus) is used to represent a regex match. Regex matching
@@ -78,9 +85,13 @@ func configureSilenceAddCmd(cc *kingpin.CmdClause) {
 		c      = &silenceAddCmd{}
 		addCmd = cc.Command("add", silenceAddHelp)
 	)
+	addCmd.Flag("tenant", "tenant").Short('t').StringVar(&c.tenant)
+	addCmd.Flag("tenant.http-header", "tenant HTTP Header").Default("X-Scope-OrgID").StringVar(&c.tenantHTTPHeader)
+	addCmd.Flag("tenant.file", "tenant file location").PlaceHolder("<filename>").ExistingFileVar(&c.tenantFile)
 	addCmd.Flag("author", "Username for CreatedBy field").Short('a').Default(username()).StringVar(&c.author)
 	addCmd.Flag("require-comment", "Require comment to be set").Hidden().Default("true").BoolVar(&c.requireComment)
 	addCmd.Flag("duration", "Duration of silence").Short('d').Default("1h").StringVar(&c.duration)
+	addCmd.Flag("max-duration", "Max Duration of silence").Default("12h").StringVar(&c.maxDuration)
 	addCmd.Flag("start", "Set when the silence should start. RFC3339 format 2006-01-02T15:04:05-07:00").StringVar(&c.start)
 	addCmd.Flag("end", "Set when the silence should end (overwrites duration). RFC3339 format 2006-01-02T15:04:05-07:00").StringVar(&c.end)
 	addCmd.Flag("comment", "A comment to help describe the silence").Short('c').StringVar(&c.comment)
@@ -139,6 +150,11 @@ func (c *silenceAddCmd) add(ctx context.Context, _ *kingpin.ParseContext) error 
 			return fmt.Errorf("silence duration must be greater than 0")
 		}
 		endsAt = startsAt.UTC().Add(time.Duration(d))
+
+		md, _ := model.ParseDuration(c.maxDuration)
+		if d > md {
+			return fmt.Errorf("silence duration '%s' couldn't be greater than '%s'", c.duration, c.maxDuration)
+		}
 	}
 
 	if startsAt.After(endsAt) {
@@ -160,15 +176,82 @@ func (c *silenceAddCmd) add(ctx context.Context, _ *kingpin.ParseContext) error 
 			Comment:   &c.comment,
 		},
 	}
-	silenceParams := silence.NewPostSilencesParams().WithContext(ctx).
-		WithSilence(ps)
+	silenceParams := silence.NewPostSilencesParams().WithContext(ctx).WithSilence(ps)
 
-	amclient := NewAlertmanagerClient(alertmanagerURL)
+	if c.tenant != "" && c.tenantFile != "" {
+		kingpin.Fatalf("tenant and tenant.file are mutually exclusive")
+	}
 
-	postOk, err := amclient.Silence.PostSilences(silenceParams)
-	if err != nil {
+	httpConfig := NewAlertmanagerClientConfig()
+	if c.tenant != "" {
+		httpConfig = setHTTPTenantHeader(httpConfig, c.tenant, c.tenantHTTPHeader)
+		amclient := NewAlertmanagerClient(alertmanagerURL, *httpConfig)
+
+		postOk, err := amclient.Silence.PostSilences(silenceParams)
+		if err != nil {
+			return fmt.Errorf("Unable to add silence for '%s' tenant: %v", c.tenant, err)
+		}
+		fmt.Printf("Silence added for '%s' tenant: %s", c.tenant, postOk.Payload.SilenceID)
+		return nil
+	} else if c.tenantFile != "" {
+
+		tenants, err := readTenantFromFile(c.tenantFile)
+		if err != nil {
+			return err
+		}
+
+		for _, t := range tenants {
+			httpConfig = setHTTPTenantHeader(httpConfig, t, c.tenantHTTPHeader)
+			amclient := NewAlertmanagerClient(alertmanagerURL, *httpConfig)
+
+			postOk, err := amclient.Silence.PostSilences(silenceParams)
+			if err != nil {
+				fmt.Printf("Unable to add silence for '%s' tenant: %v\n", t, err)
+				continue
+			}
+			fmt.Printf("Silence added for '%s' tenant: %s\n", t, postOk.Payload.SilenceID)
+
+		}
+	} else {
+		amclient := NewAlertmanagerClient(alertmanagerURL, *httpConfig)
+
+		postOk, err := amclient.Silence.PostSilences(silenceParams)
+		if err != nil {
+			return fmt.Errorf("Unable to add silence: %v", err)
+		}
+		fmt.Printf("Silence added: %s", postOk.Payload.SilenceID)
 		return err
 	}
-	_, err = fmt.Println(postOk.Payload.SilenceID)
-	return err
+	return nil
+}
+
+func readTenantFromFile(tenantFile string) ([]string, error) {
+	var tenants []string
+
+	readFile, err := os.Open(tenantFile)
+	if err != nil {
+		return tenants, fmt.Errorf("Unable to read tenant file '%s': %v", tenantFile, err)
+	}
+
+	fileScanner := bufio.NewScanner(readFile)
+	fileScanner.Split(bufio.ScanLines)
+	for fileScanner.Scan() {
+		tenants = append(tenants, fileScanner.Text())
+	}
+	readFile.Close()
+
+	return tenants, nil
+}
+
+func setHTTPTenantHeader(httpConfig *promconfig.HTTPClientConfig, tenant, tenantHTTPHeader string) *promconfig.HTTPClientConfig {
+	if httpConfig.HTTPHeaders == nil {
+		httpConfig.HTTPHeaders = &promconfig.Headers{
+			Headers: map[string]promconfig.Header{
+				tenantHTTPHeader: {Values: []string{tenant}},
+			},
+		}
+	} else {
+		httpConfig.HTTPHeaders.Headers[tenantHTTPHeader] = promconfig.Header{Values: []string{tenant}}
+	}
+	return httpConfig
 }

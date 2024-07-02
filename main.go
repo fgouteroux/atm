@@ -11,18 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cli
+package main
 
-import (
-	"github.com/alecthomas/kingpin/v2"
-)
+import "github.com/fgouteroux/atm/cli"
 
-// configureSilenceCmd represents the silence command.
-func configureSilenceCmd(app *kingpin.Application) {
-	silenceCmd := app.Command("silence", "Add, expire or view silences. For more information and additional flags see query help").PreAction(requireAlertManagerURL)
-	configureSilenceAddCmd(silenceCmd)
-	configureSilenceExpireCmd(silenceCmd)
-	configureSilenceImportCmd(silenceCmd)
-	configureSilenceQueryCmd(silenceCmd)
-	configureSilenceUpdateCmd(silenceCmd)
+func main() {
+	cli.Execute()
 }
